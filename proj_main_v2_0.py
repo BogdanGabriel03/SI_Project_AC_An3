@@ -3,8 +3,9 @@ import ctypes
 
 web_distance_cm = Value(ctypes.c_double, 0.0)
 web_angle_degrees = Value(ctypes.c_double, 90.0)
+web_state = Value(ctypes.c_bool, True)
 
-def sensor_loop(web_distance_cm, web_angle_degrees):
+def sensor_loop(web_distance_cm, web_angle_degrees, web_state):
 	import pigpio
 	import time
 	import statistics
@@ -15,7 +16,7 @@ def sensor_loop(web_distance_cm, web_angle_degrees):
 	TIMEOUT_ULTRASONIC = 28000	# us - for a max distance of 4 m it takes 24ms for a round trip
 	DISTANCE_OFFSET = 9	# erorr or 9cm
 	MAX_DISTANCE = 400 	# 400cm = 4m
-	ITER_TIME_LIMIT = 550000
+	ITER_TIME_LIMIT = 650000
 
 	# setting directions on pins
 	pi.set_mode(servo_pwm, pigpio.OUTPUT)
@@ -30,6 +31,10 @@ def sensor_loop(web_distance_cm, web_angle_degrees):
 		threshold = 0
 		i = dir_value_min
 		while True:
+			# stop the system if received command from interface
+			if not web_state.value:
+				time.sleep(0.2)
+				continue
 			total_time = pi.get_current_tick()
 			samples = []
 			pi.set_servo_pulsewidth(servo_pwm,i)
@@ -91,12 +96,16 @@ def run_web():
 	<style>
 		body { background:#111; color:#eee; text-align:center; }
 		canvas { background:#000; border:1px solid #444; }
+		#ui-container { display: flex; flex-direction: column; align-items: center; gap:12px; }
+		#btn-state { background: red; width: 160px; height: 60px; font-size: 2.5rem; border-radius: 20px; }
 	</style>
 </head>
 <body>
 <h2>Mapping system </h2>
-<canvas id="map" width="900" height="460"></canvas>
-
+<div id="ui-container">
+	<canvas id="map" width="900" height="460"></canvas>
+	<button id="btn-state" width="200" height="120">STOP</button>
+</div>
 <script>
 const canvas = document.getElementById("map");
 const ctx = canvas.getContext("2d");
@@ -172,17 +181,30 @@ async function update() {
 
 	const idx = Math.round(d.angle/ANGLE_UNIT);
 	environment_map[idx] = d.distance;
-	clearCanvas();
-	drawGrid();
-	drawDistanceLabels();
-	for(let i=0;i<environment_map.length;i++) {
-		if(environment_map[i] !== null) {
-			drawRay(i*ANGLE_UNIT, environment_map[i]);
+	if ( current_state ) {
+		clearCanvas();
+		drawGrid();
+		drawDistanceLabels();
+		for(let i=0;i<environment_map.length;i++) {
+			if(environment_map[i] !== null) {
+				drawRay(i*ANGLE_UNIT, environment_map[i]);
+			}
 		}
 	}
 }
+
+const btn = document.getElementById("btn-state");
+let current_state = true;
+btn.onclick = async () => {
+	const cmd = current_state ? "stop" : "start";
+	const r = await fetch(`/control/${cmd}`);
+	const d = await r.json();
+	current_state = d.state;
+	btn.textContent = current_state ? "STOP" : "START";
+};
+
 drawGrid();
-setInterval(update, 500);
+setInterval(update,600);
 </script>
 </body>
 </html>
@@ -194,10 +216,18 @@ setInterval(update, 500);
 		"distance": web_distance_cm.value
 		}
 
+	@route("/control/<cmd>")
+	def command(cmd):
+		if cmd == "start":
+			web_state.value = True
+		elif cmd == "stop":
+			web_state.value = False
+		return { "state": web_state.value }
+
 	run(host='0.0.0.0', port=5000, debug=False, reloader=False)
 
 if __name__ == '__main__':
-	p1 = Process(target=sensor_loop, args=(web_distance_cm,web_angle_degrees))
+	p1 = Process(target=sensor_loop, args=(web_distance_cm,web_angle_degrees, web_state))
 	p2 = Process(target=run_web)
 
 	p1.daemon = True
