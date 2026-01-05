@@ -10,11 +10,18 @@ def sensor_loop(web_distance_cm, web_angle_degrees, web_state):
 	import time
 	import statistics
 	pi = pigpio.pi()
-	servo_pwm = 18		# GPIO pin for servo direction == 12 on BOARD
-	trig_ultrasonic = 23	# GPIO pin of ultrasonic trigger == 16 on BOARD
-	echo_ultrasonic = 24 	# GPIO pin of ultrasonic echo == 18 on BOARD
+
+	# GPIO pins definitions
+	servo_pwm = 18		# 12 on BOARD
+	trig_ultrasonic = 23	# 16 on BOARD
+	echo_ultrasonic = 24 	# 18 on BOARD
+	green_led = 20		# 38 on BOARD
+	red_led = 21		# 40 on BOARD
+	button = 25		# 22 on BOARD
+
+	# CONSTANTS
 	TIMEOUT_ULTRASONIC = 28000	# us - for a max distance of 4 m it takes 24ms for a round trip
-	DISTANCE_OFFSET = 9	# erorr or 9cm
+	DISTANCE_OFFSET = 9	# erorr of 9cm
 	MAX_DISTANCE = 400 	# 400cm = 4m
 	ITER_TIME_LIMIT = 650000
 
@@ -22,6 +29,17 @@ def sensor_loop(web_distance_cm, web_angle_degrees, web_state):
 	pi.set_mode(servo_pwm, pigpio.OUTPUT)
 	pi.set_mode(trig_ultrasonic, pigpio.OUTPUT)
 	pi.set_mode(echo_ultrasonic, pigpio.INPUT)
+	pi.set_mode(green_led, pigpio.OUTPUT)
+	pi.set_mode(red_led, pigpio.OUTPUT)
+	pi.set_mode(button, pigpio.INPUT)
+	pi.set_pull_up_down(button,pigpio.PUD_UP)
+
+	def button_pressed(gpio, level, tick):
+		if level == 0:
+			with web_state.get_lock():
+				web_state.value = not web_state.value
+	pi.set_glitch_filter(button,50000)
+	cb = pi.callback(button,pigpio.FALLING_EDGE,button_pressed) 
 
 	try:
 		dir_value_min = 500
@@ -33,8 +51,13 @@ def sensor_loop(web_distance_cm, web_angle_degrees, web_state):
 		while True:
 			# stop the system if received command from interface
 			if not web_state.value:
-				time.sleep(0.2)
+				pi.write(green_led,0)
+				pi.write(red_led,1)
+				time.sleep(0.1)
 				continue
+			else:
+				pi.write(red_led,0)
+				pi.write(green_led,1)
 			total_time = pi.get_current_tick()
 			samples = []
 			pi.set_servo_pulsewidth(servo_pwm,i)
@@ -64,7 +87,10 @@ def sensor_loop(web_distance_cm, web_angle_degrees, web_state):
 						distance_cm = (0.0343*duration_us)/2 - DISTANCE_OFFSET		# cm
 				if distance_cm < MAX_DISTANCE:
 					samples.append(distance_cm)
-				time.sleep(0.06)
+				wait_time = pi.get_current_tick()
+				while True:
+					if pigpio.tickDiff(wait_time,pi.get_current_tick()) >= 60000:
+						break
 			distance_cm = statistics.median(samples)
 			with web_distance_cm.get_lock(), web_angle_degrees.get_lock():
 				web_distance_cm.value = distance_cm
@@ -77,6 +103,7 @@ def sensor_loop(web_distance_cm, web_angle_degrees, web_state):
 				step=-step
 			i = i+step
 	finally:
+		cb.cancel()
 		pi.set_servo_pulsewidth(servo_pwm,1500)
 		time.sleep(1)
 		pi.set_servo_pulsewidth(servo_pwm,0)
@@ -97,14 +124,16 @@ def run_web():
 		body { background:#111; color:#eee; text-align:center; }
 		canvas { background:#000; border:1px solid #444; }
 		#ui-container { display: flex; flex-direction: column; align-items: center; gap:12px; }
-		#btn-state { background: red; width: 160px; height: 60px; font-size: 2.5rem; border-radius: 20px; }
+		#btn-state { width: 160px; height: 60px; font-size: 2.5rem; border-radius: 20px; }
+		.btn-on { background: #d32f2f; }
+		.btn-off { background: #388e3c; }
 	</style>
 </head>
 <body>
 <h2>Mapping system </h2>
 <div id="ui-container">
 	<canvas id="map" width="900" height="460"></canvas>
-	<button id="btn-state" width="200" height="120">STOP</button>
+	<button class="btn-on" id="btn-state" width="200" height="120">STOP</button>
 </div>
 <script>
 const canvas = document.getElementById("map");
@@ -175,32 +204,37 @@ function drawRay(angle,distance) {
 		ctx.fill();
 	}
 }
-async function update() {
-	const r = await fetch("/data");
-	const d = await r.json();
-
-	const idx = Math.round(d.angle/ANGLE_UNIT);
-	environment_map[idx] = d.distance;
-	if ( current_state ) {
-		clearCanvas();
-		drawGrid();
-		drawDistanceLabels();
-		for(let i=0;i<environment_map.length;i++) {
-			if(environment_map[i] !== null) {
-				drawRay(i*ANGLE_UNIT, environment_map[i]);
-			}
-		}
-	}
-}
-
 const btn = document.getElementById("btn-state");
 let current_state = true;
+
+async function update() {
+	try {
+		const r = await fetch("/data");
+		const d = await r.json();
+
+		if (current_state !== d.state ) {
+			current_state = d.state;
+			btn.textContent = current_state ? "STOP" : "START";
+			btn.className = current_state ? "btn-on" : "btn-off";
+		}
+		if ( current_state ) {
+			const idx = Math.round(d.angle/ANGLE_UNIT);
+			environment_map[idx] = d.distance;
+			clearCanvas();
+			drawGrid();
+			drawDistanceLabels();
+			for(let i=0;i<environment_map.length;i++) {
+				if(environment_map[i] !== null) {
+					drawRay(i*ANGLE_UNIT, environment_map[i]);
+				}
+			}
+		}
+	} catch(e) {  console.log("Fetch error", e); }
+}
 btn.onclick = async () => {
-	const cmd = current_state ? "stop" : "start";
-	const r = await fetch(`/control/${cmd}`);
-	const d = await r.json();
-	current_state = d.state;
-	btn.textContent = current_state ? "STOP" : "START";
+        const cmd = current_state ? "stop" : "start";
+        const r = await fetch(`/control/${cmd}`);
+        const d = await r.json();
 };
 
 drawGrid();
@@ -213,7 +247,8 @@ setInterval(update,600);
 	def data():
 		return {
 		"angle":web_angle_degrees.value,
-		"distance": web_distance_cm.value
+		"distance": web_distance_cm.value,
+		"state": web_state.value
 		}
 
 	@route("/control/<cmd>")
@@ -228,17 +263,17 @@ setInterval(update,600);
 
 if __name__ == '__main__':
 	p1 = Process(target=sensor_loop, args=(web_distance_cm,web_angle_degrees, web_state))
-	p2 = Process(target=run_web)
+	#p2 = Process(target=run_web)
 
-	p1.daemon = True
-	p2.daemon = True
+	#p1.daemon = True
+	#p2.daemon = True
 
 	p1.start()
-	p2.start()
+	#p2.start()
+	run_web()
 
 	try:
-		while p1.is_alive() and p2.is_alive():
+		while p1.is_alive():
 			p1.join(timeout=1.0)
-			p2.join(timeout=1.0)
 	except KeyboardInterrupt:
 		print("\nUser requested stop. Shutting down...")
